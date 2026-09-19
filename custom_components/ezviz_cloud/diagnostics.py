@@ -9,7 +9,7 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DATA_COORDINATOR, DOMAIN
+from .const import DATA_COORDINATOR, DOMAIN, MQTT_HANDLER
 from .coordinator import EzvizDataUpdateCoordinator
 
 _REDACT_KEYS = {
@@ -69,7 +69,9 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics without account identifiers or media URLs."""
     coordinator: EzvizDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
     page_list = await hass.async_add_executor_job(coordinator.ezviz_client.get_device_infos)
+    mqtt_handler = hass.data[DOMAIN][entry.entry_id].get(MQTT_HANDLER)
     return {
         "ezviz_coordinator_data": _redact_device_mapping(coordinator.data),
         "ezviz_api_page_list": _redact_device_mapping(page_list),
+        "ezviz_mqtt": mqtt_handler.get_runtime_stats() if mqtt_handler else {},
     }

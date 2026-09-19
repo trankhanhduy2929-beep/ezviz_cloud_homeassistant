@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import base64
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 import json
 import logging
+import time
 from typing import Any, Final, TypedDict
 
 import paho.mqtt.client as mqtt
@@ -77,6 +78,27 @@ class MqttData(TypedDict):
     mqtt_clientid: str | None
     ticket: str | None
     push_url: str
+
+
+class MqttRuntimeStats(TypedDict):
+    """Non-sensitive MQTT counters for diagnostics and latency triage."""
+
+    received: int
+    decoded: int
+    delivered: int
+    invalid: int
+    missing_serial: int
+    connected: int
+    connect_failed: int
+    disconnected: int
+    reconnects: int
+    subscribed: int
+    subscribe_failed: int
+    last_message_monotonic: float | None
+    last_connected_monotonic: float | None
+    last_disconnect_monotonic: float | None
+    last_disconnect_reason: int | None
+    last_failure: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +225,30 @@ class MQTTClient:
         self.mqtt_client: mqtt.Client | None = None
         # Keep last payload per device, bounded by ``max_messages``
         self.messages_by_device: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.stats: MqttRuntimeStats = {
+            "received": 0,
+            "decoded": 0,
+            "delivered": 0,
+            "invalid": 0,
+            "missing_serial": 0,
+            "connected": 0,
+            "connect_failed": 0,
+            "disconnected": 0,
+            "reconnects": 0,
+            "subscribed": 0,
+            "subscribe_failed": 0,
+            "last_message_monotonic": None,
+            "last_connected_monotonic": None,
+            "last_disconnect_monotonic": None,
+            "last_disconnect_reason": None,
+            "last_failure": None,
+        }
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def connect(self, *, clean_session: bool = False, keepalive: int = 60) -> None:
+    def connect(self, *, clean_session: bool = False, keepalive: int = 30) -> None:
         """Connect to the Ezviz MQTT broker and start receiving push messages.
 
         This method performs the following steps:
@@ -219,7 +259,7 @@ class MQTTClient:
 
         Keyword Args:
           clean_session (bool, optional): Whether to start a clean MQTT session. Defaults to False.
-          keepalive (int, optional): Keep-alive interval in seconds for the MQTT connection. Defaults to 60.
+          keepalive (int, optional): Keep-alive interval in seconds for the MQTT connection. Defaults to 30.
 
         Raises:
           PyEzvizError: If required Ezviz credentials are missing or registration/start fails.
@@ -232,6 +272,13 @@ class MQTTClient:
         assert self.mqtt_client is not None
         self.mqtt_client.connect(self._mqtt_data["push_url"], 1882, keepalive)
         self.mqtt_client.loop_start()
+
+    def _ensure_server_push(self) -> None:
+        """Re-arm server-side push after a reconnect, in case registration lapsed."""
+        try:
+            self._start_ezviz_push()
+        except (HTTPError, InvalidURL, PyEzvizError) as err:
+            _LOGGER.debug("re-register push after reconnect failed: %s", err)
 
     def stop(self) -> None:
         """Stop the MQTT client and push notifications.
@@ -262,6 +309,17 @@ class MQTTClient:
         self, client: mqtt.Client, userdata: Any, mid: int, granted_qos: tuple[int, ...]
     ) -> None:
         """Handle subscription acknowledgement from the broker."""
+        if any(qos >= 128 for qos in granted_qos):
+            self.stats["subscribe_failed"] += 1
+            self.stats["last_failure"] = "subscribe_rejected"
+            _LOGGER.warning(
+                "MQTT subscription rejected: topic=%s mid=%s qos=%s",
+                self._topic,
+                mid,
+                granted_qos,
+            )
+            return
+        self.stats["subscribed"] += 1
         _LOGGER.debug(
             "MQTT subscribed: topic=%s mid=%s qos=%s", self._topic, mid, granted_qos
         )
@@ -283,16 +341,22 @@ class MQTTClient:
             flags.get("session present") if isinstance(flags, dict) else None
         )
         _LOGGER.debug("MQTT connected: rc=%s session_present=%s", rc, session_present)
-        if rc == 0 and not session_present:
-            client.subscribe(self._topic, qos=2)
-        if rc != 0:
-            # Let paho handle reconnects (reconnect_delay_set configured)
-            _LOGGER.error(
-                "MQTT connect failed: serial=%s code=%s msg=%s",
-                "unknown",
-                rc,
-                "connect_failed",
-            )
+        if rc == 0:
+            was_disconnected = self.stats["disconnected"] > 0
+            self.stats["connected"] += 1
+            self.stats["last_connected_monotonic"] = time.monotonic()
+            if not session_present:
+                client.subscribe(self._topic, qos=2)
+            if was_disconnected:
+                # Broker connection dropped earlier — make sure the EZVIZ
+                # backend still routes push to this client id.
+                self._ensure_server_push()
+            return
+
+        self.stats["connect_failed"] += 1
+        self.stats["last_failure"] = f"connect_rc_{rc}"
+        # Let paho handle reconnects (reconnect_delay_set configured)
+        _LOGGER.error("MQTT connect failed: code=%s msg=%s", rc, "connect_failed")
 
     def _on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
         """Called when the MQTT client disconnects from the broker.
@@ -304,12 +368,13 @@ class MQTTClient:
             userdata (Any): The user data passed to the client (not used).
             rc (int): Disconnect result code. 0 indicates a clean disconnect.
         """
-        _LOGGER.debug(
-            "MQTT disconnected: serial=%s code=%s msg=%s",
-            "unknown",
-            rc,
-            "disconnected",
-        )
+        self.stats["disconnected"] += 1
+        self.stats["last_disconnect_monotonic"] = time.monotonic()
+        self.stats["last_disconnect_reason"] = rc
+        if rc != 0:
+            self.stats["reconnects"] += 1
+            self.stats["last_failure"] = f"disconnect_rc_{rc}"
+        _LOGGER.debug("MQTT disconnected: code=%s msg=%s", rc, "disconnected")
 
     def _on_message(
         self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage
@@ -324,18 +389,26 @@ class MQTTClient:
             userdata (Any): The user data passed to the client (not used).
             msg (mqtt.MQTTMessage): The MQTT message object containing payload and topic.
         """
+        self.stats["received"] += 1
+        self.stats["last_message_monotonic"] = time.monotonic()
+
         try:
             decoded = self.decode_mqtt_message(msg.payload)
-        except PyEzvizError as err:
-            _LOGGER.warning("MQTT decode error: msg=%s", str(err))
+        except (PyEzvizError, UnicodeDecodeError, TypeError, ValueError) as err:
+            self.stats["invalid"] += 1
+            self.stats["last_failure"] = f"decode_{type(err).__name__}"
+            _LOGGER.warning("MQTT decode error: type=%s msg=%s", type(err).__name__, err)
             return
 
-        ext: dict[str, Any] = (
-            decoded.get("ext", {}) if isinstance(decoded.get("ext"), dict) else {}
-        )
-        device_serial = ext.get("device_serial")
-        alert_code = ext.get("alert_type_code")
-        msg_id = ext.get("msgId")
+        self.stats["decoded"] += 1
+        ext = decoded.get("ext")
+        ext_mapping = ext if isinstance(ext, Mapping) else {}
+        device_serial = ext_mapping.get("device_serial")
+        if not isinstance(device_serial, str) or not device_serial.strip():
+            device_serial = None
+
+        alert_code = ext_mapping.get("alert_type_code")
+        msg_id = ext_mapping.get("msgId")
 
         if device_serial:
             self._cache_message(device_serial, decoded)
@@ -346,6 +419,7 @@ class MQTTClient:
                 msg_id,
             )
         else:
+            self.stats["missing_serial"] += 1
             _LOGGER.debug(
                 "MQTT message missing serial: alert_code=%s msg_id=%s",
                 alert_code,
@@ -355,6 +429,7 @@ class MQTTClient:
         if self._on_message_callback:
             try:
                 self._on_message_callback(decoded)
+                self.stats["delivered"] += 1
             except Exception:
                 _LOGGER.exception("The on_message_callback raised")
 
@@ -559,8 +634,9 @@ class MQTTClient:
         # Auth (do not log these!)
         mqtt_client.username_pw_set(MQTT_APP_KEY, APP_SECRET)
 
-        # Backoff for reconnects handled by paho
-        mqtt_client.reconnect_delay_set(min_delay=5, max_delay=10)
+        # Backoff for reconnects handled by paho; keep it short so an
+        # unexpected drop resumes push quickly instead of waiting 5-10 s.
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
 
         _LOGGER.debug("Configured MQTT client for broker %s", broker)
 
@@ -601,23 +677,32 @@ class MQTTClient:
         """
         try:
             payload_str = payload_bytes.decode("utf-8")
-            data: dict[str, Any] = json.loads(payload_str)
-
-            if "ext" in data and isinstance(data["ext"], str):
-                ext_parts = data["ext"].split(",")
-                ext_dict: dict[str, Any] = {}
-                for i, name in enumerate(EXT_FIELD_NAMES):
-                    value: Any = ext_parts[i] if i < len(ext_parts) else None
-                    if value is not None and name in EXT_INT_FIELDS:
-                        with suppress(ValueError):
-                            value = int(value)
-                    ext_dict[name] = value
-                data["ext"] = ext_dict
-
-        except json.JSONDecodeError as err:
-            # Stop the client on malformed payloads as a defensive measure,
-            # mirroring previous behaviour.
-            self.stop()
+        except UnicodeDecodeError as err:
             raise PyEzvizError(f"Unable to decode MQTT message: {err}") from err
 
+        try:
+            data = json.loads(payload_str)
+        except json.JSONDecodeError as err:
+            raise PyEzvizError(f"Unable to decode MQTT message: {err}") from err
+
+        if not isinstance(data, dict):
+            raise PyEzvizError(
+                f"Unable to decode MQTT message: expected object, got {type(data).__name__}"
+            )
+
+        if "ext" in data and isinstance(data["ext"], str):
+            ext_parts = data["ext"].split(",")
+            ext_dict: dict[str, Any] = {}
+            for i, name in enumerate(EXT_FIELD_NAMES):
+                value: Any = ext_parts[i] if i < len(ext_parts) else None
+                if value is not None and name in EXT_INT_FIELDS:
+                    with suppress(ValueError):
+                        value = int(value)
+                ext_dict[name] = value
+            data["ext"] = ext_dict
+
         return data
+
+    def get_runtime_stats(self) -> MqttRuntimeStats:
+        """Return a snapshot of MQTT health counters without credentials."""
+        return self.stats.copy()

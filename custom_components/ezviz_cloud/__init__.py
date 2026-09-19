@@ -223,15 +223,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload platforms, MQTT, and the account HTTP session."""
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if data and (mqtt := data.get(MQTT_HANDLER)):
-        await hass.async_add_executor_job(mqtt.stop)
 
+    # Unload platforms first; only tear down MQTT when the entry is really
+    # going away, so a failed platform unload doesn't leave push dead.
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        if data and (coordinator := data.get(DATA_COORDINATOR)):
-            await hass.async_add_executor_job(close_local_client, coordinator.ezviz_client)
-        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
-    return unload_ok
+    if not unload_ok:
+        return False
+
+    if data and (mqtt := data.get(MQTT_HANDLER)):
+        try:
+            await hass.async_add_executor_job(mqtt.stop)
+        except Exception as err:
+            _LOGGER.debug("MQTT stop during unload failed: %s", err)
+
+    if data and (coordinator := data.get(DATA_COORDINATOR)):
+        await hass.async_add_executor_job(close_local_client, coordinator.ezviz_client)
+    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    return True
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+credentials.json
+credentials.env
+ezviz_token.json
+*.jsonl

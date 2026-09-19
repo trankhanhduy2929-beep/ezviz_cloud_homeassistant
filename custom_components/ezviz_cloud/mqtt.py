@@ -27,10 +27,8 @@ class EzvizMqttHandler:
 
     def start(self) -> None:
         """Start MQTT listener."""
+        self._coordinator = self._hass.data[DOMAIN][self._entry][DATA_COORDINATOR]
         self._mqtt.connect()
-        self._coordinator: EzvizDataUpdateCoordinator = self._hass.data[DOMAIN][self._entry][
-            DATA_COORDINATOR
-        ]
         _LOGGER.debug("EZVIZ MQTT started")
 
     def stop(self) -> None:
@@ -38,16 +36,21 @@ class EzvizMqttHandler:
         self._mqtt.stop()
         _LOGGER.debug("EZVIZ MQTT stopped")
 
+    def get_runtime_stats(self) -> dict:
+        """Return sanitized MQTT counters for diagnostics."""
+        return dict(self._mqtt.get_runtime_stats())
+
     def _on_message(self, event: dict) -> None:
         """Handle incoming MQTT push message (called from MQTT thread)."""
 
         def _handle() -> None:
             """Handle incoming MQTT push message."""
             ext = event.get("ext")
-            if not isinstance(ext, Mapping) or not ext.get("device_serial"):
+            serial_value = ext.get("device_serial") if isinstance(ext, Mapping) else None
+            if not isinstance(serial_value, str) or not serial_value.strip():
                 _LOGGER.debug("Ignored an EZVIZ MQTT event without a device id")
                 return
-            serial = str(ext["device_serial"])
+            serial = serial_value.strip()
             ha_device_id = None
 
             # Access device registry
