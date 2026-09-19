@@ -8,7 +8,7 @@ Custom integration cho [Home Assistant](https://www.home-assistant.io/) dùng t�
 
 - Repository: <https://github.com/trankhanhduy2929-beep/ezviz_cloud>
 - Domain: `ezviz_cloud`
-- Phiên bản hiện tại: `0.3.6`
+- Phiên bản hiện tại: `0.3.7`
 - Giấy phép: GPL-3.0
 
 ## Tính năng
@@ -183,7 +183,7 @@ target:
 ### Xung đột với EZVIZ integration mặc định
 
 - Có thể giữ đồng thời EZVIZ integration mặc định và `EZVIZ Cloud Auto`.
-- Bản `0.3.6` không dùng chung module global `pyezvizapi`; mỗi integration giữ phiên bản thư viện riêng.
+- Bản `0.3.6` trở lên không dùng chung module global `pyezvizapi`; mỗi integration giữ phiên bản thư viện riêng.
 - Sau khi nâng cấp, xóa thư mục custom cũ nếu cần, chép lại `custom_components/ezviz_cloud`, rồi restart Home Assistant.
 - Tải lại frontend không dùng cache.
 - Kiểm tra file `custom_components/ezviz_cloud/brand/icon.png` tồn tại đúng vị trí.
